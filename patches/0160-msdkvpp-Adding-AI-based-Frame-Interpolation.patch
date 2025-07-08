@@ -1,0 +1,183 @@
+From 43b8ceac26eb2130d203887f903aa9d4f50418e4 Mon Sep 17 00:00:00 2001
+From: Ana Schuch <ana.schuch@intel.com>
+Date: Tue, 8 Jul 2025 15:36:03 -0700
+Subject: [PATCH] Adding AI-based Frame Interpolation
+
+---
+ .../gst-plugins-bad/sys/msdk/gstmsdkvpp.c     | 65 +++++++++++++++----
+ .../gst-plugins-bad/sys/msdk/gstmsdkvpp.h     |  1 +
+ .../gst-plugins-bad/sys/msdk/meson.build      | 10 +++
+ .../gst-plugins-bad/sys/msdk/msdk-enums.c     |  1 +
+ .../gst-plugins-bad/sys/msdk/msdk-enums.h     |  1 +
+ 5 files changed, 65 insertions(+), 13 deletions(-)
+
+diff --git a/subprojects/gst-plugins-bad/sys/msdk/gstmsdkvpp.c b/subprojects/gst-plugins-bad/sys/msdk/gstmsdkvpp.c
+index 89a99527c02..c7535fe9662 100644
+--- a/subprojects/gst-plugins-bad/sys/msdk/gstmsdkvpp.c
++++ b/subprojects/gst-plugins-bad/sys/msdk/gstmsdkvpp.c
+@@ -1115,9 +1115,20 @@ ensure_filters (GstMsdkVPP * thiz)
+     gst_msdkvpp_add_extra_param (thiz, (mfxExtBuffer *) mfx_mirroring);
+   }
+ 
+-  /* Scaling Mode & Interpolation Method */
+-  if (thiz->flags & (GST_MSDK_FLAG_SCALING_MODE |
+-          GST_MSDK_FLAG_INTERPOLATION_METHOD)) {
++
++  /* AI Interpolation Method */
++  if ((thiz->flags & GST_MSDK_FLAG_INTERPOLATION_METHOD) && (thiz->interpolation_method == _MFX_INTERPOLATION_AI)){
++    mfxExtVPPAIFrameInterpolation *mfx_aiFrameInterpolation = &thiz->mfx_aiFrameInterpolation;
++    mfx_aiFrameInterpolation->Header.BufferId      = MFX_EXTBUFF_VPP_AI_FRAME_INTERPOLATION;
++    mfx_aiFrameInterpolation->Header.BufferSz      = sizeof(mfxExtVPPAIFrameInterpolation);
++    mfx_aiFrameInterpolation->FIMode               = MFX_AI_FRAME_INTERPOLATION_MODE_DEFAULT;
++    mfx_aiFrameInterpolation->EnableScd            = 1;
++    gst_msdkvpp_add_extra_param(thiz, (mfxExtBuffer *) mfx_aiFrameInterpolation);
++  }
++
++  /* Scaling Mode & Other Interpolation Method */
++  if ((thiz->flags & GST_MSDK_FLAG_SCALING_MODE) ||
++      ((thiz->flags & GST_MSDK_FLAG_INTERPOLATION_METHOD) && (thiz->interpolation_method != _MFX_INTERPOLATION_AI))){ 
+     gboolean scaling_mode_is_compute = FALSE;
+ #if (MFX_VERSION >= 2007)
+     if (thiz->scaling_mode == MFX_SCALING_MODE_INTEL_GEN_COMPUTE)
+@@ -1145,7 +1156,7 @@ ensure_filters (GstMsdkVPP * thiz)
+   }
+ 
+   /* FRC */
+-  if (thiz->flags & GST_MSDK_FLAG_FRC) {
++  if ((thiz->flags & GST_MSDK_FLAG_FRC) && !((thiz->flags & GST_MSDK_FLAG_INTERPOLATION_METHOD) && (thiz->interpolation_method == _MFX_INTERPOLATION_AI))) {
+     mfxExtVPPFrameRateConversion *mfx_frc = &thiz->mfx_frc;
+     mfx_frc->Header.BufferId = MFX_EXTBUFF_VPP_FRAME_RATE_CONVERSION;
+     mfx_frc->Header.BufferSz = sizeof (mfxExtVPPFrameRateConversion);
+@@ -1166,8 +1177,8 @@ ensure_filters (GstMsdkVPP * thiz)
+     const guint luma_den = 10000;
+     gint tmap = 0;
+ 
+-    if (in_vinfo->colorimetry.primaries || in_vinfo->colorimetry.transfer
+-        || in_vinfo->colorimetry.matrix || in_vinfo->colorimetry.range) {
++    if ((in_vinfo->colorimetry.primaries || in_vinfo->colorimetry.transfer
++        || in_vinfo->colorimetry.matrix || in_vinfo->colorimetry.range) && !((thiz->flags & GST_MSDK_FLAG_INTERPOLATION_METHOD) && (thiz->interpolation_method == _MFX_INTERPOLATION_AI))){
+       in_vsi->Header.BufferId = MFX_EXTBUFF_VIDEO_SIGNAL_INFO_IN;
+       in_vsi->Header.BufferSz = sizeof (in_vsi);
+       in_vsi->ColourDescriptionPresent = 1;
+@@ -1231,13 +1242,12 @@ ensure_filters (GstMsdkVPP * thiz)
+             MIN (thiz->cll_info.max_content_light_level, 65535);
+         cll->MaxPicAverageLightLevel =
+             MIN (thiz->cll_info.max_frame_average_light_level, 65535);
+-
+         gst_msdkvpp_add_extra_param (thiz, (mfxExtBuffer *) cll);
+         tmap = 1;
+       }
+     }
+ 
+-    if (tmap) {
++    if ((tmap) && !((thiz->flags & GST_MSDK_FLAG_INTERPOLATION_METHOD) && (thiz->interpolation_method == _MFX_INTERPOLATION_AI))) {
+       out_vinfo->colorimetry.primaries = GST_VIDEO_COLOR_PRIMARIES_BT709;
+       out_vinfo->colorimetry.transfer = GST_VIDEO_TRANSFER_BT709;
+       out_vinfo->colorimetry.range = GST_VIDEO_COLOR_RANGE_16_235;
+@@ -1353,12 +1363,41 @@ gst_msdkvpp_initialize (GstMsdkVPP * thiz)
+      */
+     thiz->frc_algm = MFX_FRCALGM_DISTRIBUTED_TIMESTAMP;
+   }
++  
++  /*Set up input and output frame structure*/
++  GstVideoFormat fmt = GST_VIDEO_INFO_FORMAT(&thiz->sinkpad_info);
++  gint width = GST_VIDEO_INFO_WIDTH(&thiz->sinkpad_info);
++  gint height = GST_VIDEO_INFO_HEIGHT(&thiz->sinkpad_info);
++
++  gint in_fps_n = GST_VIDEO_INFO_FPS_N (&thiz->sinkpad_info);
++  gint in_fps_d = GST_VIDEO_INFO_FPS_D (&thiz->sinkpad_info);
++  gint out_fps_n = GST_VIDEO_INFO_FPS_N (&thiz->srcpad_info);
++  gint out_fps_d = GST_VIDEO_INFO_FPS_D (&thiz->srcpad_info);
++
++  /*Check if framerate conversion is valid*/
++  gboolean valid_framerate = FALSE;
++  if ((in_fps_n > 0) && (in_fps_d > 0) && (out_fps_n > 0) && (out_fps_d > 0)) {
++    int64_t ratio_num = (int64_t)out_fps_n * in_fps_d;
++    int64_t ratio_den = (int64_t)out_fps_d * in_fps_n;
++    
++    if ((ratio_den != 0) && (ratio_num % ratio_den == 0)) {
++        int ratio = ratio_num / ratio_den;
++        gboolean is_power_of_two = (ratio & (ratio - 1)) == 0;
++        if ((ratio >= 2) && (is_power_of_two)) {
++            thiz->param.vpp.In.FrameRateExtN  = in_fps_n;
++            thiz->param.vpp.In.FrameRateExtD  = in_fps_d;
++            thiz->param.vpp.Out.FrameRateExtN = out_fps_n;
++            thiz->param.vpp.Out.FrameRateExtD = out_fps_d;
++            valid_framerate = TRUE;
++            GST_WARNING_OBJECT (thiz, "Setting VPP framerate to %d/%d -> %d/%d",
++                                in_fps_n, in_fps_d, out_fps_n, out_fps_d);
++        }
++    }
++  }
+ 
+-  /* work-around to avoid zero fps in msdk structure */
+-  if (!thiz->param.vpp.In.FrameRateExtN)
+-    thiz->param.vpp.In.FrameRateExtN = 30;
+-  if (!thiz->param.vpp.Out.FrameRateExtN)
+-    thiz->param.vpp.Out.FrameRateExtN = thiz->param.vpp.In.FrameRateExtN;
++  if (valid_framerate == FALSE) {
++    GST_ERROR_OBJECT (thiz, "Invalid framerate %d/%d -> %d/%d", in_fps_n, in_fps_d, out_fps_n, out_fps_d);
++  }
+ 
+   /* set vpp out picstruct as progressive if deinterlacing enabled */
+   if (thiz->flags & GST_MSDK_FLAG_DEINTERLACE)
+diff --git a/subprojects/gst-plugins-bad/sys/msdk/gstmsdkvpp.h b/subprojects/gst-plugins-bad/sys/msdk/gstmsdkvpp.h
+index 224424a4542..4074d8c5958 100644
+--- a/subprojects/gst-plugins-bad/sys/msdk/gstmsdkvpp.h
++++ b/subprojects/gst-plugins-bad/sys/msdk/gstmsdkvpp.h
+@@ -134,6 +134,7 @@ struct _GstMsdkVPP
+   mfxExtVPPMirroring mfx_mirroring;
+   mfxExtVPPScaling mfx_scaling;
+   mfxExtVPPFrameRateConversion mfx_frc;
++  mfxExtVPPAIFrameInterpolation mfx_aiFrameInterpolation ;
+ 
+   GstVideoMasteringDisplayInfo mdcv_info;
+   GstVideoContentLightLevel cll_info;
+diff --git a/subprojects/gst-plugins-bad/sys/msdk/meson.build b/subprojects/gst-plugins-bad/sys/msdk/meson.build
+index 79e7200da5f..9965946ca70 100644
+--- a/subprojects/gst-plugins-bad/sys/msdk/meson.build
++++ b/subprojects/gst-plugins-bad/sys/msdk/meson.build
+@@ -130,6 +130,16 @@ endif
+ 
+ mfx_api = get_option('mfx_api')
+ 
++if mfx_api == 'auto'
++  onevpl_dep = dependency('vpl', required : false)
++  if onevpl_dep.found()
++    mfx_api = 'oneVPL'
++  else
++    mfx_api = 'MSDK'
++  endif
++endif
++
++
+ if mfx_api != 'oneVPL'
+   mfx_dep = dependency('libmfx', version: ['>= 1.0', '<= 1.99'], required: false)
+ 
+diff --git a/subprojects/gst-plugins-bad/sys/msdk/msdk-enums.c b/subprojects/gst-plugins-bad/sys/msdk/msdk-enums.c
+index aa0f182f0cd..0b55735af88 100644
+--- a/subprojects/gst-plugins-bad/sys/msdk/msdk-enums.c
++++ b/subprojects/gst-plugins-bad/sys/msdk/msdk-enums.c
+@@ -398,6 +398,7 @@ gst_msdkvpp_interpolation_method_get_type (void)
+     {MFX_INTERPOLATION_ADVANCED,
+         "Advanced interpolation method is defined by each implementation and "
+           "usually gives best quality", "advanced"},
++    {_MFX_INTERPOLATION_AI, "AI interpolation method", "ai"},
+     {0, NULL, NULL}
+   };
+ 
+diff --git a/subprojects/gst-plugins-bad/sys/msdk/msdk-enums.h b/subprojects/gst-plugins-bad/sys/msdk/msdk-enums.h
+index 25b9ad5212e..c4867a22889 100644
+--- a/subprojects/gst-plugins-bad/sys/msdk/msdk-enums.h
++++ b/subprojects/gst-plugins-bad/sys/msdk/msdk-enums.h
+@@ -101,6 +101,7 @@ GType
+ gst_msdkvpp_scaling_mode_get_type (void);
+ 
+ #if (MFX_VERSION >= 1033) 
++#define _MFX_INTERPOLATION_AI 4
+ GType
+ gst_msdkvpp_interpolation_method_get_type (void);
+ #endif
+-- 
+2.43.0
+
